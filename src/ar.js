@@ -252,29 +252,169 @@ export class ARMode {
       scale = Math.max(0.1, Math.min(2, scale))
     }, { passive: false })
 
-    // Render loop
+    // Perspective floor rendering
+    // Halıyı 4 köşe ile zemine yatırıyoruz (trapez perspektif)
     const aspect = carpetSize.width / carpetSize.height
+
+    // Offscreen canvas for carpet source
+    const offCanvas = document.createElement('canvas')
+    offCanvas.width = img.width || 512
+    offCanvas.height = img.height || 512
+    const offCtx = offCanvas.getContext('2d')
+    offCtx.drawImage(img, 0, 0, offCanvas.width, offCanvas.height)
+
+    /**
+     * Perspektif warp: Kaynak dikdörtgeni hedef dörtgene (trapez) çizer
+     * Üçgen subdivision ile yapılır — daha fazla subdivision = daha düzgün warp
+     */
+    const drawPerspective = (srcImg, srcW, srcH, dstCorners) => {
+      // dstCorners: [topLeft, topRight, bottomRight, bottomLeft] her biri {x, y}
+      const subdivisions = 12
+
+      for (let row = 0; row < subdivisions; row++) {
+        for (let col = 0; col < subdivisions; col++) {
+          const u0 = col / subdivisions
+          const v0 = row / subdivisions
+          const u1 = (col + 1) / subdivisions
+          const v1 = (row + 1) / subdivisions
+
+          // Bilinear interpolation for destination quad
+          const lerp = (a, b, t) => a + (b - a) * t
+          const bilerp = (tl, tr, br, bl, u, v) => ({
+            x: lerp(lerp(tl.x, tr.x, u), lerp(bl.x, br.x, u), v),
+            y: lerp(lerp(tl.y, tr.y, u), lerp(bl.y, br.y, u), v)
+          })
+
+          const [tl, tr, br, bl] = dstCorners
+          const p00 = bilerp(tl, tr, br, bl, u0, v0)
+          const p10 = bilerp(tl, tr, br, bl, u1, v0)
+          const p01 = bilerp(tl, tr, br, bl, u0, v1)
+          const p11 = bilerp(tl, tr, br, bl, u1, v1)
+
+          // Source coordinates
+          const sx0 = u0 * srcW
+          const sy0 = v0 * srcH
+          const sx1 = u1 * srcW
+          const sy1 = v1 * srcH
+          const sw = sx1 - sx0
+          const sh = sy1 - sy0
+
+          // Draw two triangles per cell using affine transform
+          // Triangle 1: p00, p10, p01
+          drawTriangle(srcImg, sx0, sy0, sw, sh, p00, p10, p01, false)
+          // Triangle 2: p10, p11, p01
+          drawTriangle(srcImg, sx0, sy0, sw, sh, p10, p11, p01, true)
+        }
+      }
+    }
+
+    const drawTriangle = (srcImg, sx, sy, sw, sh, p0, p1, p2, isSecond) => {
+      ctx.save()
+      ctx.beginPath()
+      ctx.moveTo(p0.x, p0.y)
+      ctx.lineTo(p1.x, p1.y)
+      ctx.lineTo(p2.x, p2.y)
+      ctx.closePath()
+      ctx.clip()
+
+      // Affine transform: map source triangle to destination triangle
+      // For first triangle: (0,0), (1,0), (0,1)
+      // For second triangle: (1,0), (1,1), (0,1)
+      let dx0, dy0, dx1, dy1, dx2, dy2
+
+      if (!isSecond) {
+        // Source: topLeft(0,0), topRight(1,0), bottomLeft(0,1)
+        dx0 = p0.x; dy0 = p0.y  // maps to (sx, sy)
+        dx1 = p1.x; dy1 = p1.y  // maps to (sx+sw, sy)
+        dx2 = p2.x; dy2 = p2.y  // maps to (sx, sy+sh)
+      } else {
+        // Source: topRight(1,0), bottomRight(1,1), bottomLeft(0,1)
+        dx0 = p2.x; dy0 = p2.y  // bottomLeft maps to (sx, sy+sh)
+        dx1 = p0.x; dy1 = p0.y  // topRight maps to (sx+sw, sy)
+        dx2 = p1.x; dy2 = p1.y  // bottomRight maps to (sx+sw, sy+sh)
+        // Remap: want (sx, sy) → bottomLeft, (sx+sw, sy) → topRight, (sx, sy+sh) → bottomRight
+        // Actually simpler approach: use the affine from unit square
+      }
+
+      // Compute affine: maps (sx,sy)→p_tl, (sx+sw,sy)→p_tr, (sx,sy+sh)→p_bl of this sub-cell
+      // setTransform(a, b, c, d, e, f) where:
+      //   destX = a*srcX + c*srcY + e
+      //   destY = b*srcX + d*srcY + f
+
+      let stl, str, sbl
+      if (!isSecond) {
+        stl = p0; str = p1; sbl = p2
+      } else {
+        // For second triangle, we map differently
+        // (sx, sy) → p0-offset, but easier: just use direct mapping
+        stl = { x: p2.x + p0.x - p1.x, y: p2.y + p0.y - p1.y } // virtual top-left
+        str = p0
+        sbl = p2
+      }
+
+      const a = (str.x - stl.x) / sw
+      const b = (str.y - stl.y) / sw
+      const c = (sbl.x - stl.x) / sh
+      const d = (sbl.y - stl.y) / sh
+      const e = stl.x - a * sx - c * sy
+      const f = stl.y - b * sx - d * sy
+
+      ctx.setTransform(a, b, c, d, e, f)
+      ctx.drawImage(srcImg, sx, sy, sw, sh, sx, sy, sw, sh)
+
+      ctx.restore()
+    }
+
     const render = () => {
       ctx.clearRect(0, 0, W, H)
 
+      // Calculate perspective trapezoid corners
+      // Halı zemine yatmış gibi: üst kenar dar, alt kenar geniş
+      const baseW = W * 0.55 * scale
+      const baseH = baseW / aspect
+
+      // Perspektif oranı: y pozisyonuna göre
+      // Üst kenar daraltma oranı (vanishing point efekti)
+      const perspAmount = 0.45  // ne kadar perspektif (0=yok, 1=çok)
+      const topNarrow = 1 - perspAmount  // üst kenar genişlik çarpanı
+
+      // Döndürme ile birlikte köşeleri hesapla
+      const cos = Math.cos(rotation)
+      const sin = Math.sin(rotation)
+
+      // Perspektif köşeleri (döndürmeden önce, merkez 0,0)
+      const hw = baseW / 2
+      const hh = baseH / 2
+      const topW = hw * topNarrow
+
+      const corners = [
+        { x: -topW, y: -hh },       // top-left (dar)
+        { x: topW, y: -hh },        // top-right (dar)
+        { x: hw, y: hh },           // bottom-right (geniş)
+        { x: -hw, y: hh }           // bottom-left (geniş)
+      ]
+
+      // Döndür ve pozisyona taşı
+      const transformed = corners.map(p => ({
+        x: cx + p.x * cos - p.y * sin,
+        y: cy + p.x * sin + p.y * cos
+      }))
+
+      // Gölge çiz
       ctx.save()
-      ctx.translate(cx, cy)
-      ctx.rotate(rotation)
-
-      // Apply perspective skew for floor effect
-      const perspectiveScale = 0.7 + (cy / H) * 0.6
-      ctx.scale(scale * perspectiveScale, scale)
-
-      const drawH = H * 0.5
-      const drawW = drawH * aspect
-      ctx.drawImage(img, -drawW / 2, -drawH / 2, drawW, drawH)
-
-      // Subtle shadow
-      ctx.shadowColor = 'rgba(0,0,0,0.3)'
-      ctx.shadowBlur = 20
-      ctx.shadowOffsetY = 10
-
+      ctx.globalAlpha = 0.15
+      ctx.fillStyle = '#000'
+      ctx.beginPath()
+      ctx.moveTo(transformed[0].x + 3, transformed[0].y + 5)
+      ctx.lineTo(transformed[1].x + 3, transformed[1].y + 5)
+      ctx.lineTo(transformed[2].x + 3, transformed[2].y + 5)
+      ctx.lineTo(transformed[3].x + 3, transformed[3].y + 5)
+      ctx.closePath()
+      ctx.fill()
       ctx.restore()
+
+      // Halıyı perspektif warp ile çiz
+      drawPerspective(offCanvas, offCanvas.width, offCanvas.height, transformed)
 
       this._cameraRafId = requestAnimationFrame(render)
     }
